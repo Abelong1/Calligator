@@ -1237,7 +1237,7 @@ const CK_VARS = ["A", "B", "C", "D"];
 const CK_OUT_NAMES = ["F", "G", "H", "Y", "Z", "W", "P", "Q"];
 // each input variable gets its own wire color so A, B, C and D are easy to trace
 const CK_VAR_COLORS = { A: "#FF7B72", B: "#5AB0FF", C: "#FFD166", D: "#C792EA" };
-const CK_IO_W = 40, CK_IO_H = 28, CK_GATE_W = 58;
+const CK_IO_W = 46, CK_IO_H = 28, CK_GATE_W = 58;
 
 function ckGateH(k) { return Math.max(44, 16 * k + 12); }
 function ckInCount(node) { return node.kind === "gate" ? (node.gate === "NOT" ? 1 : node.inputs) : node.kind === "out" ? 1 : 0; }
@@ -1346,6 +1346,33 @@ function ckEvaluate(nodes, wires) {
   return { vars, n, outputs, rows, exprs };
 }
 
+/* Live signal on every node for the current input switches; null = not wired yet. */
+function ckSignals(nodes, wires, env) {
+  const byId = Object.fromEntries(nodes.map((nd) => [nd.id, nd]));
+  const feed = {};
+  wires.forEach((w) => (feed[w.to + ":" + w.pin] = w.from));
+  const memo = {};
+  const val = (id, seen) => {
+    if (id in memo) return memo[id];
+    const nd = byId[id];
+    if (!nd) return null;
+    if (nd.kind === "in") return (memo[id] = env[nd.v] ? 1 : 0);
+    if (seen.has(id)) return null;
+    seen.add(id);
+    const vals = [];
+    for (let i = 0; i < ckInCount(nd); i++) {
+      const src = feed[id + ":" + i];
+      const v = src ? val(src, seen) : null;
+      if (v === null) { seen.delete(id); return (memo[id] = null); }
+      vals.push(v);
+    }
+    seen.delete(id);
+    return (memo[id] = nd.kind === "out" ? vals[0] : ckApply(nd.gate, vals));
+  };
+  nodes.forEach((nd) => val(nd.id, new Set()));
+  return memo;
+}
+
 /* Starter circuits */
 let ckSeq = 1;
 const ckId = () => "n" + ckSeq++;
@@ -1408,7 +1435,7 @@ function CkGateShape({ gate, h, stroke, fill }) {
   );
 }
 
-function CircuitEditor({ nodes, setNodes, wires, setWires, colors }) {
+function CircuitEditor({ nodes, setNodes, wires, setWires, colors, levels, setLevels }) {
   const { bg, line, gold, bright, teal, cream, muted, danger } = colors;
   const svgRef = useRef(null);
   const drag = useRef(null);
@@ -1418,6 +1445,8 @@ function CircuitEditor({ nodes, setNodes, wires, setWires, colors }) {
 
   const byId = Object.fromEntries(nodes.map((nd) => [nd.id, nd]));
   const selNode = sel && sel.type === "node" ? byId[sel.id] : null;
+  const sig = useMemo(() => ckSignals(nodes, wires, levels), [nodes, wires, levels]);
+  const toggleLevel = (v) => setLevels((l) => ({ ...l, [v]: l[v] ? 0 : 1 }));
 
   const toSvg = (e) => {
     const svg = svgRef.current;
@@ -1482,7 +1511,7 @@ function CircuitEditor({ nodes, setNodes, wires, setWires, colors }) {
   const onNodeDown = (e, nd) => {
     e.stopPropagation();
     const p = toSvg(e);
-    drag.current = { id: nd.id, dx: p.x - nd.x, dy: p.y - nd.y, moved: false };
+    drag.current = { id: nd.id, dx: p.x - nd.x, dy: p.y - nd.y, sx: p.x, sy: p.y, moved: false };
     svgRef.current.setPointerCapture(e.pointerId);
     setSel({ type: "node", id: nd.id });
   };
@@ -1492,13 +1521,22 @@ function CircuitEditor({ nodes, setNodes, wires, setWires, colors }) {
     const p = toSvg(e);
     const nd = byId[d.id];
     if (!nd) return;
+    if (!d.moved && Math.hypot(p.x - d.sx, p.y - d.sy) < 4) return; // still a tap
     const { w, h } = ckSize(nd);
     const x = Math.max(0, Math.min(VW - w, p.x - d.dx));
     const y = Math.max(0, Math.min(VH - h, p.y - d.dy));
     d.moved = true;
     setNodes((prev) => prev.map((m) => (m.id === d.id ? { ...m, x, y } : m)));
   };
-  const onUp = () => { drag.current = null; };
+  const onUp = () => {
+    const d = drag.current;
+    drag.current = null;
+    // a tap (not a drag) on an input flips it between 0 and 1
+    if (d && !d.moved) {
+      const nd = byId[d.id];
+      if (nd && nd.kind === "in") toggleLevel(nd.v);
+    }
+  };
 
   const chip = (active) => ({
     fontFamily: "monospace", fontSize: 11, borderRadius: 7, padding: "6px 9px", cursor: "pointer",
@@ -1514,6 +1552,34 @@ function CircuitEditor({ nodes, setNodes, wires, setWires, colors }) {
           <button key={g} style={chip(false)} onClick={() => addGate(g)}>{g}</button>
         ))}
       </div>
+
+      {(() => {
+        const used = CK_VARS.filter((v) => nodes.some((nd) => nd.kind === "in" && nd.v === v));
+        if (!used.length) return null;
+        return (
+          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 11, color: muted }}>Inputs</span>
+            {used.map((v) => (
+              <button key={v} onClick={() => toggleLevel(v)} aria-label={`${v} is ${levels[v] ? 1 : 0}, tap to switch`}
+                style={{
+                  display: "flex", alignItems: "center", gap: 6, borderRadius: 999, padding: "4px 10px 4px 8px", cursor: "pointer",
+                  border: `1.5px solid ${CK_VAR_COLORS[v]}`, background: levels[v] ? CK_VAR_COLORS[v] : "transparent",
+                  color: levels[v] ? bg : cream, fontFamily: "monospace", fontWeight: 800, fontSize: 12,
+                }}>
+                {v} = {levels[v] ? 1 : 0}
+              </button>
+            ))}
+            {nodes.filter((nd) => nd.kind === "out").map((o) => {
+              const v = sig[o.id];
+              return (
+                <span key={o.id} style={{ marginLeft: 4, fontFamily: "monospace", fontWeight: 800, fontSize: 12, color: v === 1 ? bright : muted }}>
+                  {o.label} = {v === null || v === undefined ? "?" : v}
+                </span>
+              );
+            })}
+          </div>
+        );
+      })()}
 
       <div style={{ position: "relative", background: bg, borderRadius: 12, border: `1px solid ${line}` }}>
         <svg
@@ -1543,10 +1609,13 @@ function CircuitEditor({ nodes, setNodes, wires, setWires, colors }) {
             const on = sel && sel.type === "wire" && sel.id === "w" + i;
             // wires leaving an input take that variable's color; gate outputs stay neutral
             const wireColor = a.kind === "in" ? CK_VAR_COLORS[a.v] : cream;
+            const level = sig[a.id];
             return (
               <g key={i} onPointerDown={(e) => { e.stopPropagation(); setSel({ type: "wire", id: "w" + i }); setPending(null); }} style={{ cursor: "pointer" }}>
                 <path d={d} stroke="transparent" strokeWidth="12" fill="none" />
-                <path d={d} stroke={on ? danger : wireColor} strokeWidth={on ? 2.8 : 2} strokeOpacity={a.kind === "in" || on ? 1 : 0.75}
+                {level === 1 && !on && <path d={d} stroke={wireColor} strokeWidth="6" strokeOpacity="0.22" fill="none" />}
+                <path d={d} stroke={on ? danger : wireColor} strokeWidth={on ? 2.8 : level === 1 ? 2.6 : 1.8}
+                  strokeOpacity={on ? 1 : level === 0 ? 0.38 : 1}
                   strokeDasharray={on ? "5 3" : undefined} fill="none" />
               </g>
             );
@@ -1573,11 +1642,24 @@ function CircuitEditor({ nodes, setNodes, wires, setWires, colors }) {
                   ) : (
                     <>
                       <rect x="0" y="0" width={w} height={h} rx={nd.kind === "in" ? 14 : 6}
-                        fill={nd.kind === "in" ? CK_VAR_COLORS[nd.v] + "33" : gold + "33"}
+                        fill={nd.kind === "in" ? CK_VAR_COLORS[nd.v] + (sig[nd.id] ? "55" : "22") : sig[nd.id] === 1 ? bright + "55" : gold + "22"}
                         stroke={isSel ? bright : nd.kind === "in" ? CK_VAR_COLORS[nd.v] : stroke} strokeWidth={isSel ? 2.2 : 1.6} />
-                      <text x={w / 2} y={h / 2 + 5} textAnchor="middle" fontSize="14" fontWeight="700" fill={cream} fontFamily="monospace" style={{ pointerEvents: "none" }}>
+                      <text x={nd.kind === "in" ? 13 : 12} y={h / 2 + 5} textAnchor="middle" fontSize="14" fontWeight="700" fill={cream} fontFamily="monospace" style={{ pointerEvents: "none" }}>
                         {nd.kind === "in" ? nd.v : nd.label}
                       </text>
+                      {(() => {
+                        const v = sig[nd.id];
+                        const lit = v === 1;
+                        const c = nd.kind === "in" ? CK_VAR_COLORS[nd.v] : bright;
+                        return (
+                          <g style={{ pointerEvents: "none" }}>
+                            <rect x={w - 19} y="6" width="15" height={h - 12} rx="4" fill={lit ? c : bg} stroke={c} strokeWidth="1.2" />
+                            <text x={w - 11.5} y={h / 2 + 4} textAnchor="middle" fontSize="11" fontWeight="800" fontFamily="monospace" fill={lit ? bg : cream}>
+                              {v === null || v === undefined ? "?" : v}
+                            </text>
+                          </g>
+                        );
+                      })()}
                     </>
                   )}
                 </g>
@@ -1596,6 +1678,10 @@ function CircuitEditor({ nodes, setNodes, wires, setWires, colors }) {
                     </g>
                   );
                 })}
+                {nd.kind === "gate" && sig[nd.id] !== null && sig[nd.id] !== undefined && (
+                  <text x={op.x - 2} y={op.y - 8} textAnchor="end" fontSize="9" fontWeight="800" fontFamily="monospace"
+                    fill={sig[nd.id] ? bright : muted} style={{ pointerEvents: "none" }}>{sig[nd.id]}</text>
+                )}
                 {/* output pin */}
                 {nd.kind !== "out" && (
                   <g onPointerDown={(e) => tapOutPin(e, nd.id)} style={{ cursor: "crosshair" }}>
@@ -1618,7 +1704,7 @@ function CircuitEditor({ nodes, setNodes, wires, setWires, colors }) {
       <p style={{ fontSize: 10.5, color: muted, margin: "8px 0 0", lineHeight: 1.45 }}>
         {pending
           ? pending.kind === "out" ? "Now tap an input pin (left side) to connect." : "Now tap an output pin (right side) to connect."
-          : "Drag parts to move them. To wire: tap the dot on the right of a part (its output), then a dot on the left of another (an input). Tap a wire or part, then Delete to remove it."}
+          : "Tap an input (A–D) to switch it between 0 and 1 and watch the signal flow. Drag parts to move them. To wire: tap the dot on the right of a part, then a dot on the left of another. Tap a wire or part, then Delete."}
       </p>
 
       {sel && (
@@ -1648,6 +1734,7 @@ function KMapScreen({ onBack }) {
   const [mode, setMode] = useState("expr"); // expr | table | minterms | circuit
   const [circuit, setCircuit] = useState(() => ckExampleSOP());
   const [outId, setOutId] = useState(null);
+  const [levels, setLevels] = useState({ A: 0, B: 0, C: 0, D: 0 });
   const setCkNodes = (v) => setCircuit((c) => ({ ...c, nodes: typeof v === "function" ? v(c.nodes) : v }));
   const setCkWires = (v) => setCircuit((c) => ({ ...c, wires: typeof v === "function" ? v(c.wires) : v }));
   const ck = useMemo(() => {
@@ -1793,6 +1880,7 @@ function KMapScreen({ onBack }) {
             </div>
             <CircuitEditor
               nodes={circuit.nodes} setNodes={setCkNodes} wires={circuit.wires} setWires={setCkWires}
+              levels={levels} setLevels={setLevels}
               colors={{ bg: kBg, line: kLine, gold: kGold, bright: kGoldBright, teal: kTeal, cream: kCream, muted: kMuted, danger: kDanger }}
             />
             {ck && !ck.err && ck.outputs.length > 1 && (
@@ -1921,8 +2009,10 @@ function KMapScreen({ onBack }) {
                 </tr>
               </thead>
               <tbody>
-                {ck.rows.map((row) => (
-                  <tr key={row.index} style={{ borderTop: `1px solid ${kLine}` }}>
+                {ck.rows.map((row) => {
+                  const live = ck.vars.every((v) => (levels[v] ? 1 : 0) === row.env[v]);
+                  return (
+                  <tr key={row.index} style={{ borderTop: `1px solid ${kLine}`, background: live ? kGold + "33" : "transparent", outline: live ? `1px solid ${kGold}` : "none" }}>
                     {ck.vars.map((v) => <td key={v} style={{ padding: "3px 9px", textAlign: "center", color: kCream }}>{row.env[v]}</td>)}
                     {ck.outputs.map((o) => (
                       <td key={o.id} style={{ padding: "3px 9px", textAlign: "center", fontWeight: 700, color: row.outs[o.id] ? kTeal : kMuted, borderLeft: `1px solid ${kLine}` }}>
@@ -1930,10 +2020,12 @@ function KMapScreen({ onBack }) {
                       </td>
                     ))}
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>
+          <p style={{ fontSize: 10.5, color: kMuted, margin: "8px 0 0", textAlign: "center" }}>Highlighted row = the input switches you set above.</p>
         </div>
       )}
 
