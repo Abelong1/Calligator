@@ -1235,6 +1235,8 @@ function BooleanScreen({ onBack }) {
 const CK_GATES = ["AND", "OR", "NOT", "NAND", "NOR", "XOR", "XNOR"];
 const CK_VARS = ["A", "B", "C", "D"];
 const CK_OUT_NAMES = ["F", "G", "H", "Y", "Z", "W", "P", "Q"];
+// each input variable gets its own wire color so A, B, C and D are easy to trace
+const CK_VAR_COLORS = { A: "#FF7B72", B: "#5AB0FF", C: "#FFD166", D: "#C792EA" };
 const CK_IO_W = 40, CK_IO_H = 28, CK_GATE_W = 58;
 
 function ckGateH(k) { return Math.max(44, 16 * k + 12); }
@@ -1539,10 +1541,13 @@ function CircuitEditor({ nodes, setNodes, wires, setWires, colors }) {
             const mid = Math.max(18, Math.abs(q.x - p.x) / 2);
             const d = `M${p.x} ${p.y} C${p.x + mid} ${p.y} ${q.x - mid} ${q.y} ${q.x} ${q.y}`;
             const on = sel && sel.type === "wire" && sel.id === "w" + i;
+            // wires leaving an input take that variable's color; gate outputs stay neutral
+            const wireColor = a.kind === "in" ? CK_VAR_COLORS[a.v] : cream;
             return (
               <g key={i} onPointerDown={(e) => { e.stopPropagation(); setSel({ type: "wire", id: "w" + i }); setPending(null); }} style={{ cursor: "pointer" }}>
                 <path d={d} stroke="transparent" strokeWidth="12" fill="none" />
-                <path d={d} stroke={on ? danger : teal} strokeWidth={on ? 2.6 : 1.8} fill="none" />
+                <path d={d} stroke={on ? danger : wireColor} strokeWidth={on ? 2.8 : 2} strokeOpacity={a.kind === "in" || on ? 1 : 0.75}
+                  strokeDasharray={on ? "5 3" : undefined} fill="none" />
               </g>
             );
           })}
@@ -1567,7 +1572,9 @@ function CircuitEditor({ nodes, setNodes, wires, setWires, colors }) {
                     </>
                   ) : (
                     <>
-                      <rect x="0" y="0" width={w} height={h} rx={nd.kind === "in" ? 14 : 6} fill={nd.kind === "in" ? teal + "33" : gold + "33"} stroke={stroke} strokeWidth="1.6" />
+                      <rect x="0" y="0" width={w} height={h} rx={nd.kind === "in" ? 14 : 6}
+                        fill={nd.kind === "in" ? CK_VAR_COLORS[nd.v] + "33" : gold + "33"}
+                        stroke={isSel ? bright : nd.kind === "in" ? CK_VAR_COLORS[nd.v] : stroke} strokeWidth={isSel ? 2.2 : 1.6} />
                       <text x={w / 2} y={h / 2 + 5} textAnchor="middle" fontSize="14" fontWeight="700" fill={cream} fontFamily="monospace" style={{ pointerEvents: "none" }}>
                         {nd.kind === "in" ? nd.v : nd.label}
                       </text>
@@ -1578,11 +1585,14 @@ function CircuitEditor({ nodes, setNodes, wires, setWires, colors }) {
                 {Array.from({ length: k }, (_, i) => {
                   const p = ckInPin(nd, i);
                   const pend = pending && pending.kind === "in" && pending.id === nd.id && pending.pin === i;
-                  const filled = wires.some((wr) => wr.to === nd.id && wr.pin === i);
+                  const feedWire = wires.find((wr) => wr.to === nd.id && wr.pin === i);
+                  const filled = !!feedWire;
+                  const src = feedWire && byId[feedWire.from];
+                  const pinColor = src ? (src.kind === "in" ? CK_VAR_COLORS[src.v] : cream) : teal;
                   return (
                     <g key={"i" + i} onPointerDown={(e) => tapInPin(e, nd.id, i)} style={{ cursor: "crosshair" }}>
                       <circle cx={p.x} cy={p.y} r="11" fill="transparent" />
-                      <circle cx={p.x} cy={p.y} r={pend ? 6 : 4.5} fill={pend ? bright : filled ? teal : bg} stroke={pend ? bright : teal} strokeWidth="1.6" />
+                      <circle cx={p.x} cy={p.y} r={pend ? 6 : 4.5} fill={pend ? bright : filled ? pinColor : bg} stroke={pend ? bright : pinColor} strokeWidth="1.6" />
                     </g>
                   );
                 })}
@@ -1591,7 +1601,8 @@ function CircuitEditor({ nodes, setNodes, wires, setWires, colors }) {
                   <g onPointerDown={(e) => tapOutPin(e, nd.id)} style={{ cursor: "crosshair" }}>
                     <circle cx={op.x} cy={op.y} r="11" fill="transparent" />
                     <circle cx={op.x} cy={op.y} r={pending && pending.kind === "out" && pending.id === nd.id ? 6 : 4.5}
-                      fill={pending && pending.kind === "out" && pending.id === nd.id ? bright : gold} stroke={bright} strokeWidth="1.4" />
+                      fill={pending && pending.kind === "out" && pending.id === nd.id ? bright : nd.kind === "in" ? CK_VAR_COLORS[nd.v] : gold}
+                      stroke={nd.kind === "in" ? CK_VAR_COLORS[nd.v] : bright} strokeWidth="1.4" />
                   </g>
                 )}
               </g>
@@ -1613,7 +1624,8 @@ function CircuitEditor({ nodes, setNodes, wires, setWires, colors }) {
       {sel && (
         <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, marginTop: 8 }}>
           {selNode && selNode.kind === "in" && CK_VARS.map((v) => (
-            <button key={v} style={chip(selNode.v === v)} onClick={() => setVar(v)}>{v}</button>
+            <button key={v} style={{ ...chip(selNode.v === v), ...(selNode.v === v ? { background: CK_VAR_COLORS[v], borderColor: CK_VAR_COLORS[v] } : { color: CK_VAR_COLORS[v] }) }}
+              onClick={() => setVar(v)}>{v}</button>
           ))}
           {selNode && selNode.kind === "gate" && selNode.gate !== "NOT" && (
             <>
