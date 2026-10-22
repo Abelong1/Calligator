@@ -735,14 +735,16 @@ function bkDiffOne(a, b) {
   return { count, pos, combined };
 }
 
-function bkRunQM(minterms, n, vars, log) {
+function bkRunQM(minterms, n, vars, log, dontCares = []) {
   if (minterms.length === 0) return { selected: [], allZero: true, primes: [], essential: [], additional: null };
-  if (minterms.length === Math.pow(2, n)) {
-    const pi = { bits: "-".repeat(n), minterms: minterms.slice() };
+  if (minterms.length + dontCares.length === Math.pow(2, n)) {
+    const pi = { bits: "-".repeat(n), minterms: [...minterms, ...dontCares].sort((a, b) => a - b) };
     return { selected: [pi], allOne: true, primes: [pi], essential: [], additional: null };
   }
 
-  let current = minterms.map((m) => ({ bits: bkToBin(m, n), minterms: [m] }));
+  // don't-cares join the grouping (so groups can grow) but never need covering
+  const seed = [...new Set([...minterms, ...dontCares])].sort((a, b) => a - b);
+  let current = seed.map((m) => ({ bits: bkToBin(m, n), minterms: [m] }));
   const allPrimes = [];
   let round = 1;
   while (current.length) {
@@ -772,7 +774,8 @@ function bkRunQM(minterms, n, vars, log) {
   }
   const primeMap = new Map();
   allPrimes.forEach((p) => primeMap.set(p.bits + "#" + p.minterms.join(","), p));
-  const primes = [...primeMap.values()];
+  // a group made only of don't-cares is never useful
+  const primes = [...primeMap.values()].filter((p) => p.minterms.some((m) => minterms.includes(m)));
 
   const selected = [];
   const essential = []; // { minterm, prime }
@@ -876,10 +879,17 @@ function bkEvaluate(raw) {
     const out = bkEvalRPN(rpn, env);
     rows.push({ index: i, env, out });
   }
+  return bkSolveRows(vars, n, rows);
+}
+
+/* Minimize from a truth-table output column. out is 1, 0, or "X" (don't care). */
+function bkSolveRows(vars, n, rows) {
   const minterms = rows.filter((r) => r.out === 1).map((r) => r.index);
+  const dontCares = rows.filter((r) => r.out === "X").map((r) => r.index);
+  const maxterms = rows.filter((r) => r.out === 0).map((r) => r.index);
 
   const log = [];
-  const qm = bkRunQM(minterms, n, vars, log);
+  const qm = bkRunQM(minterms, n, vars, log, dontCares);
 
   let minimized, canonical;
   if (qm.allZero) { minimized = "0"; canonical = ""; }
@@ -891,12 +901,11 @@ function bkEvaluate(raw) {
 
   // POS: group the 0-cells (maxterms) with the same QM routine, then
   // turn each group into a sum term with complemented literals.
-  const maxterms = rows.filter((r) => r.out === 0).map((r) => r.index);
   let pos, posSelected = [];
   if (!maxterms.length) pos = "1";
   else if (!minterms.length) pos = "0";
   else {
-    const qmPos = bkRunQM(maxterms, n, vars, []);
+    const qmPos = bkRunQM(maxterms, n, vars, [], dontCares);
     posSelected = qmPos.selected || [];
     pos = posSelected.map((pi) => {
       const lits = pi.bits.split("").map((b, i) => (b === "-" ? null : b === "0" ? vars[i] : vars[i] + "'")).filter(Boolean);
@@ -905,7 +914,7 @@ function bkEvaluate(raw) {
   }
 
   return {
-    vars, n, rows, minterms, log, pos, posSelected,
+    vars, n, rows, minterms, dontCares, maxterms, log, pos, posSelected,
     selected: qm.selected || [],
     primes: qm.primes || [],
     essential: qm.essential || [],
@@ -914,6 +923,31 @@ function bkEvaluate(raw) {
     allOne: !!qm.allOne,
     minimized: minimized || "0", canonical,
   };
+}
+
+/* Build a result from K-map cells (index -> 0 / 1 / "X") using variables A..D. */
+function bkFromCells(n, cells) {
+  const vars = ["A", "B", "C", "D"].slice(0, n);
+  const rows = [];
+  for (let i = 0; i < Math.pow(2, n); i++) rows.push({ index: i, out: cells[i] ?? 0 });
+  return bkSolveRows(vars, n, rows);
+}
+
+/* Parse "1, 3, 5-7" into indexes; throws on anything out of range. */
+function bkParseIndexList(text, max, label) {
+  const out = new Set();
+  const parts = text.split(/[\s,;]+/).filter(Boolean);
+  for (const part of parts) {
+    const range = part.match(/^(\d+)-(\d+)$/);
+    if (range) {
+      const a = +range[1], b = +range[2];
+      if (a > b) throw new Error(`${label}: "${part}" — range should go low to high.`);
+      for (let i = a; i <= b; i++) out.add(i);
+    } else if (/^\d+$/.test(part)) out.add(+part);
+    else throw new Error(`${label}: "${part}" isn't a number. Use numbers like 1, 3, 5-7.`);
+  }
+  for (const v of out) if (v >= max) throw new Error(`${label}: ${v} is too big — with this many variables the cells go 0 to ${max - 1}.`);
+  return [...out].sort((a, b) => a - b);
 }
 
 /* =========================================================
@@ -1194,18 +1228,61 @@ function BooleanScreen({ onBack }) {
    Karnaugh Map screen
    ========================================================= */
 function KMapScreen({ onBack }) {
+  const [mode, setMode] = useState("expr"); // expr | table | minterms
   const [expr, setExpr] = useState("AB' + A'B");
   const [preset, setPreset] = useState("custom");
+  const [nVars, setNVars] = useState(3);
+  const [cells, setCells] = useState({});
+  const [mText, setMText] = useState("1, 3, 5, 7");
+  const [dText, setDText] = useState("");
   const inputRef = useRef(null);
 
   const result = useMemo(() => {
     try {
+      if (mode === "table") return bkFromCells(nVars, cells);
+      if (mode === "minterms") {
+        const max = Math.pow(2, nVars);
+        const ones = bkParseIndexList(mText, max, "Minterms");
+        const dcs = bkParseIndexList(dText, max, "Don't cares");
+        const clash = ones.find((m) => dcs.includes(m));
+        if (clash !== undefined) throw new Error(`${clash} is in both lists — a cell is either 1 or don't care.`);
+        const c = {};
+        ones.forEach((m) => (c[m] = 1));
+        dcs.forEach((m) => (c[m] = "X"));
+        return bkFromCells(nVars, c);
+      }
       return bkEvaluate(expr);
     } catch (e) {
       return { err: e.message };
     }
-  }, [expr]);
+  }, [mode, expr, nVars, cells, mText, dText]);
   const err = result.err;
+
+  // tap a cell in table mode: 0 -> 1 -> X -> 0
+  const cycleCell = (idx) => {
+    setCells((c) => {
+      const cur = c[idx] ?? 0;
+      const next = cur === 0 ? 1 : cur === 1 ? "X" : 0;
+      const copy = { ...c };
+      if (next === 0) delete copy[idx]; else copy[idx] = next;
+      return copy;
+    });
+  };
+  const changeVars = (n) => {
+    setNVars(n);
+    const max = Math.pow(2, n);
+    setCells((c) => Object.fromEntries(Object.entries(c).filter(([k]) => +k < max)));
+  };
+  // carry the current map over when switching to table mode
+  const switchMode = (m) => {
+    if (m === "table" && !err && result.n >= 2 && result.n <= 4) {
+      const c = {};
+      result.rows.forEach((row) => { if (row.out === 1 || row.out === "X") c[row.index] = row.out; });
+      setNVars(result.n);
+      setCells(c);
+    }
+    setMode(m);
+  };
 
   const insertSym = (sym) => {
     const el = inputRef.current;
@@ -1256,8 +1333,73 @@ function KMapScreen({ onBack }) {
         <h2 style={{ fontWeight: 800, fontSize: 20, margin: "0 0 4px", fontFamily: "'Baloo 2',sans-serif" }}>
           Karnaugh <span style={{ color: kGoldBright }}>Map</span>
         </h2>
-        <p style={{ color: kMuted, fontSize: 11.5, margin: "0 0 14px", lineHeight: 1.4 }}>Enter an expression using A–D (1–4 variables).</p>
+        <p style={{ color: kMuted, fontSize: 11.5, margin: "0 0 12px", lineHeight: 1.4 }}>
+          Type the circuit's expression, tap 1s into the table, or list the minterms. It solves as you go.
+        </p>
 
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 4, background: kBg, borderRadius: 10, padding: 4, marginBottom: 14 }}>
+          {[["expr", "Expression"], ["table", "Fill table"], ["minterms", "Minterms"]].map(([k, label]) => (
+            <button
+              key={k}
+              onClick={() => switchMode(k)}
+              style={{
+                border: "none", borderRadius: 7, padding: "8px 4px", cursor: "pointer", fontSize: 11.5, fontWeight: 700,
+                background: mode === k ? kGold : "transparent", color: mode === k ? kBg : kCream,
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {mode !== "expr" && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+            <span style={{ fontSize: 11, color: kMuted }}>Variables</span>
+            {[2, 3, 4].map((n) => (
+              <button
+                key={n}
+                onClick={() => changeVars(n)}
+                style={{ ...kKeyBtn, padding: "6px 12px", background: nVars === n ? kGold : kBg, color: nVars === n ? kBg : kCream, fontWeight: 700 }}
+              >
+                {n} <span style={{ fontWeight: 400, opacity: 0.75 }}>({["A", "B", "C", "D"].slice(0, n).join("")})</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {mode === "table" && (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <p style={{ fontSize: 11, color: kMuted, margin: 0, lineHeight: 1.4 }}>
+              Tap a cell in the K-map below: 0 → 1 → X (don't care).
+            </p>
+            <button style={{ ...kKeyBtn, color: kDanger, borderColor: `${kDanger}66`, flex: "none" }} onClick={() => setCells({})}>Clear</button>
+          </div>
+        )}
+
+        {mode === "minterms" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <label style={{ fontSize: 11, color: kMuted }}>
+              Minterms Σm( … )
+              <input
+                type="text" inputMode="numeric" spellCheck={false} value={mText} onChange={(e) => setMText(e.target.value)}
+                placeholder="e.g. 0, 2, 5-7"
+                style={{ display: "block", marginTop: 4, width: "100%", background: kBg, border: `1px solid ${kGold}4d`, color: kCream, fontFamily: "monospace", fontSize: 14, padding: "10px 12px", borderRadius: 9, outline: "none", boxSizing: "border-box" }}
+              />
+            </label>
+            <label style={{ fontSize: 11, color: kMuted }}>
+              Don't cares d( … ) — optional
+              <input
+                type="text" inputMode="numeric" spellCheck={false} value={dText} onChange={(e) => setDText(e.target.value)}
+                placeholder="e.g. 3, 11"
+                style={{ display: "block", marginTop: 4, width: "100%", background: kBg, border: `1px solid ${kGold}4d`, color: kCream, fontFamily: "monospace", fontSize: 14, padding: "10px 12px", borderRadius: 9, outline: "none", boxSizing: "border-box" }}
+              />
+            </label>
+          </div>
+        )}
+
+        {mode !== "expr" && err && <div style={{ marginTop: 10, color: kDanger, fontSize: 12 }}>{err}</div>}
+
+        {mode === "expr" && (<>
         <input
           ref={inputRef}
           type="text"
@@ -1297,6 +1439,7 @@ function KMapScreen({ onBack }) {
             </button>
           ))}
         </div>
+        </>)}
       </div>
 
       <div style={kPanelStyle}>
@@ -1309,10 +1452,15 @@ function KMapScreen({ onBack }) {
             From grouping the 0-cells: {result.posSelected.map((pi) => "{" + pi.minterms.join(", ") + "}").join(" ")}
           </p>
         )}
+        {!err && (
+          <p style={{ color: kMuted, fontSize: 11, margin: "10px 0 0", fontFamily: "monospace", lineHeight: 1.5, wordBreak: "break-word" }}>
+            F = Σm({result.minterms.join(", ") || "—"}){result.dontCares && result.dontCares.length ? ` + d(${result.dontCares.join(", ")})` : ""}
+          </p>
+        )}
       </div>
 
       <div style={{ ...kPanelStyle, marginBottom: 26 }}>
-        <h3 style={{ fontWeight: 700, fontSize: 12.5, margin: "0 0 12px", fontFamily: "'Baloo 2',sans-serif", textAlign: "center" }}>K-map grid</h3>
+        <h3 style={{ fontWeight: 700, fontSize: 12.5, margin: "0 0 12px", fontFamily: "'Baloo 2',sans-serif", textAlign: "center", color: kCream }}>K-map grid</h3>
         {err ? (
           <div style={{ color: kMuted, fontSize: 12, textAlign: "center" }}>—</div>
         ) : !layout ? (
@@ -1335,17 +1483,25 @@ function KMapScreen({ onBack }) {
                         const bits = rBits + cBits;
                         const idx = parseInt(bits, 2);
                         const isOn = outByIndex[idx] === 1;
+                        const isDc = outByIndex[idx] === "X";
+                        const editable = mode === "table";
                         const dots = result.selected.filter((pi) => pi.minterms.includes(idx));
                         return (
                           <td
                             key={ci}
+                            onClick={editable ? () => cycleCell(idx) : undefined}
+                            role={editable ? "button" : undefined}
+                            aria-label={editable ? `Cell ${idx}, value ${isOn ? 1 : isDc ? "don't care" : 0}` : undefined}
                             style={{
-                              border: `1px solid ${kLine}`, width: 38, height: 38, textAlign: "center", position: "relative",
-                              background: isOn ? `${kTeal}14` : "transparent", color: isOn ? kTeal : kMuted, fontWeight: isOn ? 700 : 400,
+                              border: `1px solid ${editable ? kGold + "66" : kLine}`, width: editable ? 50 : 38, height: editable ? 50 : 38,
+                              textAlign: "center", position: "relative", cursor: editable ? "pointer" : "default", userSelect: "none",
+                              background: isOn ? `${kTeal}24` : isDc ? `${kGold}14` : "transparent",
+                              color: isOn ? kTeal : isDc ? kGoldBright : kMuted, fontWeight: isOn || isDc ? 700 : 400,
+                              fontSize: editable ? 15 : 11,
                             }}
                           >
                             <div style={{ fontSize: 8, color: kMuted, position: "absolute", top: 2, left: 3 }}>{idx}</div>
-                            <div>{isOn ? 1 : 0}</div>
+                            <div>{isOn ? 1 : isDc ? "X" : 0}</div>
                             <div style={{ display: "flex", justifyContent: "center", gap: 2, position: "absolute", bottom: 2, left: 0, right: 0 }}>
                               {dots.map((pi, i) => (
                                 <span key={i} style={{ width: 4, height: 4, borderRadius: "50%", background: piColor.get(pi), display: "inline-block" }} />
@@ -1360,7 +1516,7 @@ function KMapScreen({ onBack }) {
               </table>
             </div>
             {result.minterms.length === 0 ? (
-              <p style={{ color: kMuted, fontSize: 12, marginTop: 10, textAlign: "center" }}>No 1-cells to group.</p>
+              <p style={{ color: kMuted, fontSize: 12, marginTop: 10, textAlign: "center" }}>{mode === "table" ? "Tap cells to add 1s — groups appear here." : "No 1-cells to group."}</p>
             ) : (
               <div style={{ marginTop: 14 }}>
                 {result.selected.map((pi, idx) => {
