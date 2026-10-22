@@ -1227,8 +1227,421 @@ function BooleanScreen({ onBack }) {
 /* =========================================================
    Karnaugh Map screen
    ========================================================= */
+/* =========================================================
+   Logic circuit builder (used by the K-map "Circuit" mode)
+   Nodes: inputs (A–D), gates, outputs. Wires go from an output
+   pin to a gate/output input pin. Evaluated into a truth table.
+   ========================================================= */
+const CK_GATES = ["AND", "OR", "NOT", "NAND", "NOR", "XOR", "XNOR"];
+const CK_VARS = ["A", "B", "C", "D"];
+const CK_OUT_NAMES = ["F", "G", "H", "Y", "Z", "W", "P", "Q"];
+const CK_IO_W = 40, CK_IO_H = 28, CK_GATE_W = 58;
+
+function ckGateH(k) { return Math.max(44, 16 * k + 12); }
+function ckInCount(node) { return node.kind === "gate" ? (node.gate === "NOT" ? 1 : node.inputs) : node.kind === "out" ? 1 : 0; }
+function ckSize(node) {
+  if (node.kind === "gate") return { w: CK_GATE_W, h: ckGateH(ckInCount(node)) };
+  return { w: CK_IO_W, h: CK_IO_H };
+}
+function ckInPin(node, i) {
+  if (node.kind === "out") return { x: node.x, y: node.y + CK_IO_H / 2 };
+  const h = ckSize(node).h, k = ckInCount(node);
+  return { x: node.x, y: node.y + ((i + 1) * h) / (k + 1) };
+}
+function ckOutPin(node) {
+  const { w, h } = ckSize(node);
+  return { x: node.x + w, y: node.y + h / 2 };
+}
+
+function ckApply(gate, vals) {
+  const and = vals.every((v) => v === 1) ? 1 : 0;
+  const or = vals.some((v) => v === 1) ? 1 : 0;
+  const xor = vals.reduce((a, v) => a ^ v, 0);
+  switch (gate) {
+    case "AND": return and;
+    case "OR": return or;
+    case "NOT": return vals[0] ? 0 : 1;
+    case "NAND": return and ? 0 : 1;
+    case "NOR": return or ? 0 : 1;
+    case "XOR": return xor;
+    case "XNOR": return xor ? 0 : 1;
+    default: return 0;
+  }
+}
+
+function ckGateLabel(node, idx) {
+  return `${node.gate} gate #${idx}`;
+}
+
+/* Evaluate the circuit. Returns { vars, n, outputs, rows, exprs } or throws a friendly error. */
+function ckEvaluate(nodes, wires) {
+  const byId = Object.fromEntries(nodes.map((nd) => [nd.id, nd]));
+  const inputs = nodes.filter((nd) => nd.kind === "in");
+  const outputs = nodes.filter((nd) => nd.kind === "out");
+  if (!inputs.length) throw new Error("Add at least one input (A–D).");
+  if (!outputs.length) throw new Error("Add an output so there's something to solve.");
+  const vars = CK_VARS.filter((v) => inputs.some((nd) => nd.v === v));
+  const n = vars.length;
+  const feed = {};
+  wires.forEach((w) => (feed[w.to + ":" + w.pin] = w.from));
+  const gateIdx = {};
+  nodes.filter((nd) => nd.kind === "gate").forEach((nd, i) => (gateIdx[nd.id] = i + 1));
+
+  // check every input pin is connected
+  for (const nd of nodes) {
+    const k = ckInCount(nd);
+    for (let i = 0; i < k; i++) {
+      if (!feed[nd.id + ":" + i]) {
+        if (nd.kind === "out") throw new Error(`Output ${nd.label} isn't connected yet.`);
+        throw new Error(`${ckGateLabel(nd, gateIdx[nd.id])} has an empty input — wire it up.`);
+      }
+    }
+  }
+
+  const evalNode = (id, env, seen) => {
+    const nd = byId[id];
+    if (nd.kind === "in") return env[nd.v];
+    if (seen.has(id)) throw new Error("The circuit loops back on itself — remove the feedback wire.");
+    seen.add(id);
+    const vals = [];
+    for (let i = 0; i < ckInCount(nd); i++) vals.push(evalNode(feed[id + ":" + i], env, seen));
+    seen.delete(id);
+    return nd.kind === "out" ? vals[0] : ckApply(nd.gate, vals);
+  };
+
+  const rows = [];
+  for (let i = 0; i < Math.pow(2, n); i++) {
+    const env = {};
+    vars.forEach((v, j) => (env[v] = (i >> (n - 1 - j)) & 1));
+    const outs = {};
+    outputs.forEach((o) => (outs[o.id] = evalNode(o.id, env, new Set())));
+    rows.push({ index: i, env, outs });
+  }
+
+  // unsimplified expression straight from the wiring, for reference
+  const exprOf = (id, seen) => {
+    const nd = byId[id];
+    if (nd.kind === "in") return nd.v;
+    if (seen.has(id)) return "?";
+    seen.add(id);
+    const parts = [];
+    for (let i = 0; i < ckInCount(nd); i++) parts.push(exprOf(feed[id + ":" + i], seen));
+    seen.delete(id);
+    if (nd.kind === "out") return parts[0];
+    const wrap = (p) => (p.length > 2 ? "(" + p + ")" : p);
+    switch (nd.gate) {
+      case "NOT": return wrap(parts[0]) + "'";
+      case "AND": return parts.map(wrap).join("");
+      case "OR": return parts.join(" + ");
+      case "XOR": return parts.map(wrap).join(" ⊕ ");
+      case "NAND": return "(" + parts.map(wrap).join("") + ")'";
+      case "NOR": return "(" + parts.join(" + ") + ")'";
+      case "XNOR": return "(" + parts.map(wrap).join(" ⊕ ") + ")'";
+      default: return "?";
+    }
+  };
+  const exprs = Object.fromEntries(outputs.map((o) => [o.id, exprOf(o.id, new Set())]));
+  return { vars, n, outputs, rows, exprs };
+}
+
+/* Starter circuits */
+let ckSeq = 1;
+const ckId = () => "n" + ckSeq++;
+function ckExampleSOP() {
+  // F = AB + A'C  (the classic AND-OR circuit)
+  const a = { id: ckId(), kind: "in", v: "A", x: 8, y: 20 };
+  const b = { id: ckId(), kind: "in", v: "B", x: 8, y: 80 };
+  const c = { id: ckId(), kind: "in", v: "C", x: 8, y: 200 };
+  const not = { id: ckId(), kind: "gate", gate: "NOT", inputs: 1, x: 70, y: 120 };
+  const g1 = { id: ckId(), kind: "gate", gate: "AND", inputs: 2, x: 150, y: 30 };
+  const g2 = { id: ckId(), kind: "gate", gate: "AND", inputs: 2, x: 150, y: 150 };
+  const or = { id: ckId(), kind: "gate", gate: "OR", inputs: 2, x: 235, y: 90 };
+  const f = { id: ckId(), kind: "out", label: "F", x: 312, y: 104 };
+  const nodes = [a, b, c, not, g1, g2, or, f];
+  const wires = [
+    { from: a.id, to: g1.id, pin: 0 }, { from: b.id, to: g1.id, pin: 1 },
+    { from: a.id, to: not.id, pin: 0 }, { from: not.id, to: g2.id, pin: 0 }, { from: c.id, to: g2.id, pin: 1 },
+    { from: g1.id, to: or.id, pin: 0 }, { from: g2.id, to: or.id, pin: 1 },
+    { from: or.id, to: f.id, pin: 0 },
+  ];
+  return { nodes, wires };
+}
+function ckExampleDecoder() {
+  // 2-to-4 decoder: F=A'B', G=A'B, H=AB', Y=AB
+  const a = { id: ckId(), kind: "in", v: "A", x: 6, y: 30 };
+  const b = { id: ckId(), kind: "in", v: "B", x: 6, y: 210 };
+  const na = { id: ckId(), kind: "gate", gate: "NOT", inputs: 1, x: 62, y: 70 };
+  const nb = { id: ckId(), kind: "gate", gate: "NOT", inputs: 1, x: 62, y: 160 };
+  const gs = [0, 1, 2, 3].map((i) => ({ id: ckId(), kind: "gate", gate: "AND", inputs: 2, x: 190, y: 8 + i * 66 }));
+  const outs = ["F", "G", "H", "Y"].map((l, i) => ({ id: ckId(), kind: "out", label: l, x: 290, y: 16 + i * 66 }));
+  const src = [[na, nb], [na, b], [a, nb], [a, b]];
+  const wires = [{ from: a.id, to: na.id, pin: 0 }, { from: b.id, to: nb.id, pin: 0 }];
+  gs.forEach((g, i) => {
+    wires.push({ from: src[i][0].id, to: g.id, pin: 0 }, { from: src[i][1].id, to: g.id, pin: 1 }, { from: g.id, to: outs[i].id, pin: 0 });
+  });
+  return { nodes: [a, b, na, nb, ...gs, ...outs], wires };
+}
+
+function CkGateShape({ gate, h, stroke, fill }) {
+  const bubble = gate === "NAND" || gate === "NOR" || gate === "XNOR" || gate === "NOT";
+  const bodyEnd = bubble ? 47 : 52;
+  let body;
+  if (gate === "AND" || gate === "NAND") {
+    body = <path d={`M8 0 H24 Q${bodyEnd} 0 ${bodyEnd} ${h / 2} Q${bodyEnd} ${h} 24 ${h} H8 Z`} />;
+  } else if (gate === "NOT") {
+    body = <path d={`M10 ${h / 2 - 15} L${bodyEnd} ${h / 2} L10 ${h / 2 + 15} Z`} />;
+  } else {
+    body = (
+      <>
+        <path d={`M8 0 Q30 0 ${bodyEnd} ${h / 2} Q30 ${h} 8 ${h} Q18 ${h / 2} 8 0 Z`} />
+        {(gate === "XOR" || gate === "XNOR") && <path d={`M3 0 Q13 ${h / 2} 3 ${h}`} fill="none" />}
+      </>
+    );
+  }
+  return (
+    <g stroke={stroke} strokeWidth="1.8" fill={fill}>
+      {body}
+      {bubble && <circle cx={bodyEnd + 3.5} cy={h / 2} r="3.5" />}
+    </g>
+  );
+}
+
+function CircuitEditor({ nodes, setNodes, wires, setWires, colors }) {
+  const { bg, line, gold, bright, teal, cream, muted, danger } = colors;
+  const svgRef = useRef(null);
+  const drag = useRef(null);
+  const [sel, setSel] = useState(null); // { type: "node"|"wire", id }
+  const [pending, setPending] = useState(null); // { kind: "out", id } or { kind: "in", id, pin }
+  const VW = 360, VH = 290;
+
+  const byId = Object.fromEntries(nodes.map((nd) => [nd.id, nd]));
+  const selNode = sel && sel.type === "node" ? byId[sel.id] : null;
+
+  const toSvg = (e) => {
+    const svg = svgRef.current;
+    const pt = svg.createSVGPoint();
+    pt.x = e.clientX; pt.y = e.clientY;
+    return pt.matrixTransform(svg.getScreenCTM().inverse());
+  };
+
+  const place = () => {
+    const k = nodes.length;
+    return { x: 20 + ((k * 47) % 250), y: 20 + ((k * 61) % 220) };
+  };
+  const addInput = () => {
+    const used = new Set(nodes.filter((nd) => nd.kind === "in").map((nd) => nd.v));
+    const v = CK_VARS.find((x) => !used.has(x)) || "A";
+    const nd = { id: ckId(), kind: "in", v, ...place(), x: 6 };
+    setNodes([...nodes, nd]); setSel({ type: "node", id: nd.id });
+  };
+  const addOutput = () => {
+    const used = new Set(nodes.filter((nd) => nd.kind === "out").map((nd) => nd.label));
+    const label = CK_OUT_NAMES.find((x) => !used.has(x)) || "F";
+    const nd = { id: ckId(), kind: "out", label, ...place(), x: VW - CK_IO_W - 6 };
+    setNodes([...nodes, nd]); setSel({ type: "node", id: nd.id });
+  };
+  const addGate = (gate) => {
+    const nd = { id: ckId(), kind: "gate", gate, inputs: gate === "NOT" ? 1 : 2, ...place(), x: 120 + ((nodes.length * 23) % 120) };
+    setNodes([...nodes, nd]); setSel({ type: "node", id: nd.id });
+  };
+  const removeSelected = () => {
+    if (!sel) return;
+    if (sel.type === "node") {
+      setNodes(nodes.filter((nd) => nd.id !== sel.id));
+      setWires(wires.filter((w) => w.from !== sel.id && w.to !== sel.id));
+    } else {
+      setWires(wires.filter((_, i) => "w" + i !== sel.id));
+    }
+    setSel(null); setPending(null);
+  };
+  const setInputs = (k) => {
+    if (!selNode || selNode.kind !== "gate" || selNode.gate === "NOT") return;
+    const kk = Math.max(2, Math.min(4, k));
+    setNodes(nodes.map((nd) => (nd.id === selNode.id ? { ...nd, inputs: kk } : nd)));
+    setWires(wires.filter((w) => !(w.to === selNode.id && w.pin >= kk)));
+  };
+  const setVar = (v) => setNodes(nodes.map((nd) => (nd.id === selNode.id ? { ...nd, v } : nd)));
+
+  const connect = (fromId, toId, pin) => {
+    if (fromId === toId) return;
+    setWires([...wires.filter((w) => !(w.to === toId && w.pin === pin)), { from: fromId, to: toId, pin }]);
+  };
+  const tapOutPin = (e, id) => {
+    e.stopPropagation();
+    if (pending && pending.kind === "in") { connect(id, pending.id, pending.pin); setPending(null); return; }
+    setPending(pending && pending.kind === "out" && pending.id === id ? null : { kind: "out", id });
+  };
+  const tapInPin = (e, id, pin) => {
+    e.stopPropagation();
+    if (pending && pending.kind === "out") { connect(pending.id, id, pin); setPending(null); return; }
+    setPending(pending && pending.kind === "in" && pending.id === id && pending.pin === pin ? null : { kind: "in", id, pin });
+  };
+
+  const onNodeDown = (e, nd) => {
+    e.stopPropagation();
+    const p = toSvg(e);
+    drag.current = { id: nd.id, dx: p.x - nd.x, dy: p.y - nd.y, moved: false };
+    svgRef.current.setPointerCapture(e.pointerId);
+    setSel({ type: "node", id: nd.id });
+  };
+  const onMove = (e) => {
+    const d = drag.current;
+    if (!d) return;
+    const p = toSvg(e);
+    const nd = byId[d.id];
+    if (!nd) return;
+    const { w, h } = ckSize(nd);
+    const x = Math.max(0, Math.min(VW - w, p.x - d.dx));
+    const y = Math.max(0, Math.min(VH - h, p.y - d.dy));
+    d.moved = true;
+    setNodes((prev) => prev.map((m) => (m.id === d.id ? { ...m, x, y } : m)));
+  };
+  const onUp = () => { drag.current = null; };
+
+  const chip = (active) => ({
+    fontFamily: "monospace", fontSize: 11, borderRadius: 7, padding: "6px 9px", cursor: "pointer",
+    border: `1px solid ${active ? gold : gold + "40"}`, background: active ? gold : bg, color: active ? bg : cream, fontWeight: 700,
+  });
+
+  return (
+    <div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 8 }}>
+        <button style={{ ...chip(false), color: teal }} onClick={addInput}>+ Input</button>
+        <button style={{ ...chip(false), color: bright }} onClick={addOutput}>+ Output</button>
+        {CK_GATES.map((g) => (
+          <button key={g} style={chip(false)} onClick={() => addGate(g)}>{g}</button>
+        ))}
+      </div>
+
+      <div style={{ position: "relative", background: bg, borderRadius: 12, border: `1px solid ${line}` }}>
+        <svg
+          ref={svgRef}
+          viewBox={`0 0 ${VW} ${VH}`}
+          width="100%"
+          style={{ display: "block", touchAction: "none", userSelect: "none" }}
+          onPointerMove={onMove}
+          onPointerUp={onUp}
+          onPointerCancel={onUp}
+          onPointerDown={() => { setSel(null); setPending(null); }}
+        >
+          <defs>
+            <pattern id="ckgrid" width="20" height="20" patternUnits="userSpaceOnUse">
+              <circle cx="1" cy="1" r="0.8" fill={line} />
+            </pattern>
+          </defs>
+          <rect width={VW} height={VH} fill="url(#ckgrid)" />
+
+          {/* wires */}
+          {wires.map((w, i) => {
+            const a = byId[w.from], b = byId[w.to];
+            if (!a || !b) return null;
+            const p = ckOutPin(a), q = ckInPin(b, w.pin);
+            const mid = Math.max(18, Math.abs(q.x - p.x) / 2);
+            const d = `M${p.x} ${p.y} C${p.x + mid} ${p.y} ${q.x - mid} ${q.y} ${q.x} ${q.y}`;
+            const on = sel && sel.type === "wire" && sel.id === "w" + i;
+            return (
+              <g key={i} onPointerDown={(e) => { e.stopPropagation(); setSel({ type: "wire", id: "w" + i }); setPending(null); }} style={{ cursor: "pointer" }}>
+                <path d={d} stroke="transparent" strokeWidth="12" fill="none" />
+                <path d={d} stroke={on ? danger : teal} strokeWidth={on ? 2.6 : 1.8} fill="none" />
+              </g>
+            );
+          })}
+
+          {/* nodes */}
+          {nodes.map((nd) => {
+            const { w, h } = ckSize(nd);
+            const isSel = sel && sel.type === "node" && sel.id === nd.id;
+            const stroke = isSel ? bright : cream;
+            const k = ckInCount(nd);
+            const op = ckOutPin(nd);
+            return (
+              <g key={nd.id}>
+                <g transform={`translate(${nd.x} ${nd.y})`} onPointerDown={(e) => onNodeDown(e, nd)} style={{ cursor: "grab" }}>
+                  {nd.kind === "gate" ? (
+                    <>
+                      <rect x="0" y="0" width={w} height={h} fill="transparent" />
+                      <CkGateShape gate={nd.gate} h={h} stroke={stroke} fill="#2a241d" />
+                      <text x="27" y={h / 2 + 3} textAnchor="middle" fontSize="8" fill={muted} fontFamily="monospace" style={{ pointerEvents: "none" }}>
+                        {nd.gate === "NOT" ? "" : nd.gate}
+                      </text>
+                    </>
+                  ) : (
+                    <>
+                      <rect x="0" y="0" width={w} height={h} rx={nd.kind === "in" ? 14 : 6} fill={nd.kind === "in" ? teal + "33" : gold + "33"} stroke={stroke} strokeWidth="1.6" />
+                      <text x={w / 2} y={h / 2 + 5} textAnchor="middle" fontSize="14" fontWeight="700" fill={cream} fontFamily="monospace" style={{ pointerEvents: "none" }}>
+                        {nd.kind === "in" ? nd.v : nd.label}
+                      </text>
+                    </>
+                  )}
+                </g>
+                {/* input pins */}
+                {Array.from({ length: k }, (_, i) => {
+                  const p = ckInPin(nd, i);
+                  const pend = pending && pending.kind === "in" && pending.id === nd.id && pending.pin === i;
+                  const filled = wires.some((wr) => wr.to === nd.id && wr.pin === i);
+                  return (
+                    <g key={"i" + i} onPointerDown={(e) => tapInPin(e, nd.id, i)} style={{ cursor: "crosshair" }}>
+                      <circle cx={p.x} cy={p.y} r="11" fill="transparent" />
+                      <circle cx={p.x} cy={p.y} r={pend ? 6 : 4.5} fill={pend ? bright : filled ? teal : bg} stroke={pend ? bright : teal} strokeWidth="1.6" />
+                    </g>
+                  );
+                })}
+                {/* output pin */}
+                {nd.kind !== "out" && (
+                  <g onPointerDown={(e) => tapOutPin(e, nd.id)} style={{ cursor: "crosshair" }}>
+                    <circle cx={op.x} cy={op.y} r="11" fill="transparent" />
+                    <circle cx={op.x} cy={op.y} r={pending && pending.kind === "out" && pending.id === nd.id ? 6 : 4.5}
+                      fill={pending && pending.kind === "out" && pending.id === nd.id ? bright : gold} stroke={bright} strokeWidth="1.4" />
+                  </g>
+                )}
+              </g>
+            );
+          })}
+
+          {!nodes.length && (
+            <text x={VW / 2} y={VH / 2} textAnchor="middle" fontSize="12" fill={muted}>Add inputs, gates and an output above</text>
+          )}
+        </svg>
+      </div>
+
+      <p style={{ fontSize: 10.5, color: muted, margin: "8px 0 0", lineHeight: 1.45 }}>
+        {pending
+          ? pending.kind === "out" ? "Now tap an input pin (left side) to connect." : "Now tap an output pin (right side) to connect."
+          : "Drag parts to move them. To wire: tap the dot on the right of a part (its output), then a dot on the left of another (an input). Tap a wire or part, then Delete to remove it."}
+      </p>
+
+      {sel && (
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, marginTop: 8 }}>
+          {selNode && selNode.kind === "in" && CK_VARS.map((v) => (
+            <button key={v} style={chip(selNode.v === v)} onClick={() => setVar(v)}>{v}</button>
+          ))}
+          {selNode && selNode.kind === "gate" && selNode.gate !== "NOT" && (
+            <>
+              <span style={{ fontSize: 11, color: muted }}>Inputs</span>
+              <button style={chip(false)} onClick={() => setInputs(selNode.inputs - 1)}>−</button>
+              <span style={{ fontSize: 12, color: cream, fontFamily: "monospace" }}>{selNode.inputs}</span>
+              <button style={chip(false)} onClick={() => setInputs(selNode.inputs + 1)}>+</button>
+            </>
+          )}
+          <button style={{ ...chip(false), color: danger, borderColor: danger + "66", marginLeft: "auto" }} onClick={removeSelected}>
+            Delete {sel.type === "wire" ? "wire" : selNode ? (selNode.kind === "gate" ? selNode.gate : selNode.kind === "in" ? "input" : "output") : ""}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function KMapScreen({ onBack }) {
-  const [mode, setMode] = useState("expr"); // expr | table | minterms
+  const [mode, setMode] = useState("expr"); // expr | table | minterms | circuit
+  const [circuit, setCircuit] = useState(() => ckExampleSOP());
+  const [outId, setOutId] = useState(null);
+  const setCkNodes = (v) => setCircuit((c) => ({ ...c, nodes: typeof v === "function" ? v(c.nodes) : v }));
+  const setCkWires = (v) => setCircuit((c) => ({ ...c, wires: typeof v === "function" ? v(c.wires) : v }));
+  const ck = useMemo(() => {
+    if (mode !== "circuit") return null;
+    try { return ckEvaluate(circuit.nodes, circuit.wires); } catch (e) { return { err: e.message }; }
+  }, [mode, circuit]);
   const [expr, setExpr] = useState("AB' + A'B");
   const [preset, setPreset] = useState("custom");
   const [nVars, setNVars] = useState(3);
@@ -1240,6 +1653,12 @@ function KMapScreen({ onBack }) {
   const result = useMemo(() => {
     try {
       if (mode === "table") return bkFromCells(nVars, cells);
+      if (mode === "circuit") {
+        if (ck.err) throw new Error(ck.err);
+        const o = ck.outputs.find((x) => x.id === outId) || ck.outputs[0];
+        const rows = ck.rows.map((row) => ({ index: row.index, env: row.env, out: row.outs[o.id] }));
+        return { ...bkSolveRows(ck.vars, ck.n, rows), circuitOut: o };
+      }
       if (mode === "minterms") {
         const max = Math.pow(2, nVars);
         const ones = bkParseIndexList(mText, max, "Minterms");
@@ -1255,7 +1674,7 @@ function KMapScreen({ onBack }) {
     } catch (e) {
       return { err: e.message };
     }
-  }, [mode, expr, nVars, cells, mText, dText]);
+  }, [mode, expr, nVars, cells, mText, dText, ck, outId]);
   const err = result.err;
 
   // tap a cell in table mode: 0 -> 1 -> X -> 0
@@ -1334,11 +1753,11 @@ function KMapScreen({ onBack }) {
           Karnaugh <span style={{ color: kGoldBright }}>Map</span>
         </h2>
         <p style={{ color: kMuted, fontSize: 11.5, margin: "0 0 12px", lineHeight: 1.4 }}>
-          Type the circuit's expression, tap 1s into the table, or list the minterms. It solves as you go.
+          Type an expression, build the circuit from gates, tap 1s into the table, or list minterms. It solves as you go.
         </p>
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 4, background: kBg, borderRadius: 10, padding: 4, marginBottom: 14 }}>
-          {[["expr", "Expression"], ["table", "Fill table"], ["minterms", "Minterms"]].map(([k, label]) => (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 4, background: kBg, borderRadius: 10, padding: 4, marginBottom: 14 }}>
+          {[["expr", "Expression"], ["circuit", "Circuit"], ["table", "Table"], ["minterms", "Minterms"]].map(([k, label]) => (
             <button
               key={k}
               onClick={() => switchMode(k)}
@@ -1352,7 +1771,43 @@ function KMapScreen({ onBack }) {
           ))}
         </div>
 
-        {mode !== "expr" && (
+        {mode === "circuit" && (
+          <>
+            <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
+              <span style={{ fontSize: 11, color: kMuted, alignSelf: "center" }}>Start from</span>
+              <button style={kKeyBtn} onClick={() => { setCircuit(ckExampleSOP()); setOutId(null); }}>AB + A'C</button>
+              <button style={kKeyBtn} onClick={() => { setCircuit(ckExampleDecoder()); setOutId(null); }}>2-to-4 decoder</button>
+              <button style={{ ...kKeyBtn, color: kDanger, borderColor: `${kDanger}66` }} onClick={() => { setCircuit({ nodes: [], wires: [] }); setOutId(null); }}>Blank</button>
+            </div>
+            <CircuitEditor
+              nodes={circuit.nodes} setNodes={setCkNodes} wires={circuit.wires} setWires={setCkWires}
+              colors={{ bg: kBg, line: kLine, gold: kGold, bright: kGoldBright, teal: kTeal, cream: kCream, muted: kMuted, danger: kDanger }}
+            />
+            {ck && !ck.err && ck.outputs.length > 1 && (
+              <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 12, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 11, color: kMuted }}>Solve output</span>
+                {ck.outputs.map((o) => {
+                  const on = (result.circuitOut && result.circuitOut.id) === o.id;
+                  return (
+                    <button key={o.id} onClick={() => setOutId(o.id)}
+                      style={{ ...kKeyBtn, padding: "6px 12px", background: on ? kGold : kBg, color: on ? kBg : kCream, fontWeight: 700 }}>
+                      {o.label}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            {ck && !ck.err && (
+              <div style={{ marginTop: 12, fontSize: 11.5, color: kMuted, fontFamily: "monospace", lineHeight: 1.6, wordBreak: "break-word" }}>
+                {ck.outputs.map((o) => (
+                  <div key={o.id}><span style={{ color: kCream }}>{o.label}</span> = {ck.exprs[o.id]} <span style={{ opacity: 0.7 }}>(as wired)</span></div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {(mode === "table" || mode === "minterms") && (
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
             <span style={{ fontSize: 11, color: kMuted }}>Variables</span>
             {[2, 3, 4].map((n) => (
@@ -1442,8 +1897,38 @@ function KMapScreen({ onBack }) {
         </>)}
       </div>
 
+      {mode === "circuit" && ck && !ck.err && (
+        <div style={kPanelStyle}>
+          <p style={{ fontFamily: "monospace", fontSize: 10, color: kMuted, textTransform: "uppercase", letterSpacing: "0.05em", margin: "0 0 8px" }}>Truth table</p>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ borderCollapse: "collapse", fontFamily: "monospace", fontSize: 12, margin: "0 auto" }}>
+              <thead>
+                <tr>
+                  {ck.vars.map((v) => <th key={v} style={{ padding: "4px 9px", color: kMuted }}>{v}</th>)}
+                  {ck.outputs.map((o) => <th key={o.id} style={{ padding: "4px 9px", color: kGoldBright, borderLeft: `1px solid ${kLine}` }}>{o.label}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {ck.rows.map((row) => (
+                  <tr key={row.index} style={{ borderTop: `1px solid ${kLine}` }}>
+                    {ck.vars.map((v) => <td key={v} style={{ padding: "3px 9px", textAlign: "center", color: kCream }}>{row.env[v]}</td>)}
+                    {ck.outputs.map((o) => (
+                      <td key={o.id} style={{ padding: "3px 9px", textAlign: "center", fontWeight: 700, color: row.outs[o.id] ? kTeal : kMuted, borderLeft: `1px solid ${kLine}` }}>
+                        {row.outs[o.id]}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
       <div style={kPanelStyle}>
-        <p style={{ fontFamily: "monospace", fontSize: 10, color: kMuted, textTransform: "uppercase", letterSpacing: "0.05em", margin: "0 0 8px" }}>Minimized SOP</p>
+        <p style={{ fontFamily: "monospace", fontSize: 10, color: kMuted, textTransform: "uppercase", letterSpacing: "0.05em", margin: "0 0 8px" }}>
+          Minimized SOP{mode === "circuit" && result.circuitOut ? ` — ${result.circuitOut.label}` : ""}
+        </p>
         <div style={{ fontSize: 18, fontWeight: 700, color: kGoldBright, fontFamily: "monospace", wordBreak: "break-word" }}>{err ? "—" : result.minimized}</div>
         <p style={{ fontFamily: "monospace", fontSize: 10, color: kMuted, textTransform: "uppercase", letterSpacing: "0.05em", margin: "14px 0 8px" }}>Minimized POS</p>
         <div style={{ fontSize: 18, fontWeight: 700, color: kTeal, fontFamily: "monospace", wordBreak: "break-word" }}>{err ? "—" : result.pos}</div>
@@ -1454,7 +1939,7 @@ function KMapScreen({ onBack }) {
         )}
         {!err && (
           <p style={{ color: kMuted, fontSize: 11, margin: "10px 0 0", fontFamily: "monospace", lineHeight: 1.5, wordBreak: "break-word" }}>
-            F = Σm({result.minterms.join(", ") || "—"}){result.dontCares && result.dontCares.length ? ` + d(${result.dontCares.join(", ")})` : ""}
+            {(result.circuitOut && result.circuitOut.label) || "F"} = Σm({result.minterms.join(", ") || "—"}){result.dontCares && result.dontCares.length ? ` + d(${result.dontCares.join(", ")})` : ""}
           </p>
         )}
       </div>

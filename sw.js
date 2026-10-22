@@ -1,5 +1,5 @@
 // Offline cache: serve the app shell from cache, refresh it in the background.
-const CACHE = "calligator-v2";
+const CACHE = "calligator-v3";
 const ASSETS = ["/", "/index.html", "/manifest.json", "/icon-192.png", "/icon-512.png"];
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)));
